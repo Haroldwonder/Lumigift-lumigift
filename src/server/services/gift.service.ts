@@ -7,6 +7,8 @@ import { serverConfig } from "@/server/config";
 import { assertValidTransition } from "./gift-state-machine";
 import { createGiftInvitation } from "./invitation.service";
 import { sendGiftInvitation } from "@/lib/sms";
+import { stripHtmlTags } from "@/lib/sanitize";
+import { createAuditLog } from "./audit.service";
 
 // ─── Exchange rate helper ─────────────────────────────────────────────────────
 import { getExchangeRate } from "@/server/services/exchange-rate.service";
@@ -68,6 +70,9 @@ export async function createGift(
   const amountUsdc = await ngnToUsdc(input.amountNgn);
   const recipientPhoneHash = hashPhone(input.recipientPhone);
 
+  // Sanitize message content to prevent stored XSS
+  const sanitizedMessage = input.message ? stripHtmlTags(input.message) : undefined;
+
   const gift: Gift = {
     id,
     senderId,
@@ -75,7 +80,7 @@ export async function createGift(
     recipientName: input.recipientName,
     amountNgn: input.amountNgn,
     amountUsdc,
-    message: input.message,
+    message: sanitizedMessage,
     unlockAt: new Date(input.unlockAt),
     status: "pending_payment",
     createdAt: new Date(),
@@ -83,6 +88,21 @@ export async function createGift(
   };
 
   gifts.set(id, gift);
+
+  // Create audit log for gift creation
+  await createAuditLog({
+    eventType: "gift_created",
+    userId: senderId,
+    giftId: id,
+    amountNgn: input.amountNgn,
+    amountUsdc,
+    metadata: {
+      recipientName: input.recipientName,
+      unlockAt: input.unlockAt,
+      paymentProvider: input.paymentProvider,
+      recipientIsRegistered,
+    },
+  });
 
   // If recipient is unregistered, create an invitation and send SMS
   if (!recipientIsRegistered) {
@@ -143,9 +163,30 @@ export async function updateGiftStatus(id: string, status: GiftStatus): Promise<
   const gift = gifts.get(id);
   if (!gift) return null;
   assertValidTransition(gift.status, status);
+  const previousStatus = gift.status;
   gift.status = status;
   gift.updatedAt = new Date();
   gifts.set(id, gift);
+
+  // Create audit log for status change
+  const eventType = status === "funded" ? "gift_funded" as const : 
+                    status === "claimed" ? "gift_claimed" as const :
+                    status === "cancelled" ? "gift_cancelled" as const : null;
+
+  if (eventType) {
+    await createAuditLog({
+      eventType,
+      userId: gift.senderId,
+      giftId: id,
+      amountNgn: gift.amountNgn,
+      amountUsdc: gift.amountUsdc,
+      metadata: {
+        previousStatus,
+        newStatus: status,
+      },
+    });
+  }
+
   return gift;
 }
 
