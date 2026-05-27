@@ -128,30 +128,6 @@ export class EscrowClient {
     return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
   }
 
-  // ── expire ────────────────────────────────────────────────────────────────────
-
-  /**
-   * Builds an `expire` transaction envelope ready to be signed and submitted.
-   */
-  async buildExpire(): Promise<string> {
-    const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
-
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.opts.networkPassphrase,
-    })
-      .addOperation(this.contract.call("expire"))
-      .setTimeout(30)
-      .build();
-
-    const simResult = await this.rpc.simulateTransaction(tx);
-    if (SorobanRpc.Api.isSimulationError(simResult)) {
-      throw parseContractError(simResult.error);
-    }
-
-    return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
-  }
-
   // ── set_admin ────────────────────────────────────────────────────────────────
 
   /**
