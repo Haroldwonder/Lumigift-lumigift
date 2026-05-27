@@ -82,6 +82,8 @@ export class EscrowClient {
   /**
    * Builds an `initialize` transaction envelope ready to be signed and submitted.
    *
+   * @param admin       - Stellar public key of the contract admin (G…)
+   * @param giftId      - Unique identifier for the gift (Symbol)
    * @param sender      - Stellar public key of the gift sender (G…)
    * @param recipient   - Stellar public key of the gift recipient (G…)
    * @param token       - USDC contract address (C…)
@@ -89,6 +91,8 @@ export class EscrowClient {
    * @param unlockTime  - Unix timestamp (u64) after which the gift can be claimed
    */
   async buildInitialize(
+    admin: string,
+    giftId: string,
     sender: string,
     recipient: string,
     token: string,
@@ -104,12 +108,66 @@ export class EscrowClient {
       .addOperation(
         this.contract.call(
           "initialize",
+          new Address(admin).toScVal(),
+          nativeToScVal(giftId, { type: "symbol" }),
           new Address(sender).toScVal(),
           new Address(recipient).toScVal(),
           new Address(token).toScVal(),
           nativeToScVal(amount, { type: "i128" }),
           nativeToScVal(unlockTime, { type: "u64" })
         )
+      )
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.rpc.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw parseContractError(simResult.error);
+    }
+
+    return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  }
+
+  // ── expire ────────────────────────────────────────────────────────────────────
+
+  /**
+   * Builds an `expire` transaction envelope ready to be signed and submitted.
+   */
+  async buildExpire(): Promise<string> {
+    const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.opts.networkPassphrase,
+    })
+      .addOperation(this.contract.call("expire"))
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.rpc.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw parseContractError(simResult.error);
+    }
+
+    return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  }
+
+  // ── set_admin ────────────────────────────────────────────────────────────────
+
+  /**
+   * Builds a `set_admin` transaction envelope ready to be signed and submitted.
+   *
+   * @param newAdmin - Stellar public key of the new admin (G…)
+   */
+  async buildSetAdmin(newAdmin: string): Promise<string> {
+    const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.opts.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call("set_admin", new Address(newAdmin).toScVal())
       )
       .setTimeout(30)
       .build();
