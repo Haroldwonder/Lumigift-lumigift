@@ -118,19 +118,26 @@ const POST_CLAIM_TTL_LEDGERS: u32 = 120_960;
 //                                                                       ▼
 //                                                                  [Claimed]
 
+/// Keys stored in **persistent** instance storage (critical state).
 #[contracttype]
 pub enum DataKey {
     /// The address authorized to call `upgrade`. Set once during `initialize`.
     Admin,
     Sender,
     Recipient,
-    Token,
-    Amount,
     UnlockTime,
     Claimed,
     Cancelled,
     Expired,
     GiftId,
+}
+
+/// Keys stored in **temporary** storage (short-lived, lower ledger cost).
+#[contracttype]
+pub enum TempKey {
+    Sender,
+    Token,
+    Amount,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -227,8 +234,8 @@ impl EscrowContract {
 
         let claimed: bool = env
             .storage()
-            .instance()
-            .get(&DataKey::Claimed)
+            .persistent()
+            .get(&PersistentKey::Claimed)
             .unwrap_or(false);
 
         if claimed {
@@ -272,7 +279,8 @@ impl EscrowContract {
             .get(&DataKey::GiftId)
             .ok_or(EscrowError::NotInitialized)?;
 
-        env.storage().instance().set(&DataKey::Claimed, &true);
+        // Effects before interactions (reentrancy guard)
+        env.storage().persistent().set(&PersistentKey::Claimed, &true);
 
         // Extend TTL so the claimed state stays readable for reconciliation.
         // unlock_time is in the past here, so required_ttl_ledgers returns BUFFER_LEDGERS.
@@ -490,8 +498,8 @@ impl EscrowContract {
             .ok_or(EscrowError::NotInitialized)?;
         let claimed: bool = env
             .storage()
-            .instance()
-            .get(&DataKey::Claimed)
+            .persistent()
+            .get(&PersistentKey::Claimed)
             .unwrap_or(false);
 
         Ok((recipient, amount, unlock_time, claimed))
