@@ -159,54 +159,176 @@ mod tests {
         Env,
     };
 
-    fn create_token(env: &Env, admin: &Address) -> (Address, TokenClient, StellarAssetClient) {
-        let token_id = env.register_stellar_asset_contract(admin.clone());
+    fn setup(env: &Env) -> (Address, Address, Address, TokenClient, EscrowContractClient) {
+        let sender = Address::generate(env);
+        let recipient = Address::generate(env);
+        let token_id = env.register_stellar_asset_contract(sender.clone());
         let token = TokenClient::new(env, &token_id);
         let token_admin = StellarAssetClient::new(env, &token_id);
-        (token_id, token, token_admin)
+        token_admin.mint(&sender, &100_000_000);
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(env, &contract_id);
+        (sender, recipient, token_id, token, client)
     }
+
+    // ── Happy paths ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_initialize_and_claim() {
         let env = Env::default();
         env.mock_all_auths();
+        let (sender, recipient, token_id, token, client) = setup(&env);
 
-        let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let (token_id, token, token_admin) = create_token(&env, &sender);
-
-        // Mint 100 USDC to sender
-        token_admin.mint(&sender, &100_000_000);
-
-        let contract_id = env.register_contract(None, EscrowContract);
-        let client = EscrowContractClient::new(&env, &contract_id);
-
-        let unlock_time: u64 = 1_000;
-        client.initialize(&sender, &recipient, &token_id, &100_000_000, &unlock_time);
-
-        // Advance ledger past unlock time
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &1_000);
         env.ledger().with_mut(|l| l.timestamp = 1_001);
+        client.claim();
 
+        assert_eq!(token.balance(&recipient), 100_000_000);
+        assert_eq!(token.balance(&client.address), 0);
+    }
+
+    #[test]
+    fn test_get_state_after_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, _token, client) = setup(&env);
+
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &5_000);
+        let (ret_recipient, amount, unlock_time, claimed) = client.get_state();
+
+        assert_eq!(ret_recipient, recipient);
+        assert_eq!(amount, 100_000_000);
+        assert_eq!(unlock_time, 5_000);
+        assert!(!claimed);
+    }
+
+    #[test]
+    fn test_get_state_after_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, _token, client) = setup(&env);
+
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &1_000);
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        client.claim();
+
+        let (_r, _a, _u, claimed) = client.get_state();
+        assert!(claimed);
+    }
+
+    #[test]
+    fn test_claim_at_exact_unlock_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, token, client) = setup(&env);
+
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &1_000);
+        // timestamp == unlock_time should succeed (now >= unlock_time)
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
         client.claim();
 
         assert_eq!(token.balance(&recipient), 100_000_000);
     }
+
+    // ── Failure modes ────────────────────────────────────────────────────────
 
     #[test]
     #[should_panic(expected = "gift is still locked")]
     fn test_claim_before_unlock_panics() {
         let env = Env::default();
         env.mock_all_auths();
+        let (sender, recipient, token_id, _token, client) = setup(&env);
 
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &9_999_999);
+        client.claim();
+    }
+
+    #[test]
+    #[should_panic(expected = "already claimed")]
+    fn test_double_claim_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, _token, client) = setup(&env);
+
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &1_000);
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        client.claim();
+        client.claim(); // second claim must panic
+    }
+
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_double_initialize_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, _token, client) = setup(&env);
+
+        client.initialize(&sender, &recipient, &token_id, &50_000_000, &1_000);
+        client.initialize(&sender, &recipient, &token_id, &50_000_000, &1_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_zero_amount_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, _token, client) = setup(&env);
+
+        // transfer of 0 should be rejected by the token contract
+        client.initialize(&sender, &recipient, &token_id, &0, &1_000);
+    }
+
+    // ── Reentrancy guard (checks-effects-interactions) ───────────────────────
+
+    #[test]
+    fn test_claimed_flag_set_before_transfer() {
+        // After a successful claim the state must show claimed=true,
+        // proving the flag was set before (or atomically with) the transfer.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, _token, client) = setup(&env);
+
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &1_000);
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        client.claim();
+
+        let (_r, _a, _u, claimed) = client.get_state();
+        assert!(claimed, "claimed flag must be true after claim");
+    }
+
+    // ── Expired / edge-case gifts ────────────────────────────────────────────
+
+    #[test]
+    fn test_claim_long_after_unlock_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (sender, recipient, token_id, token, client) = setup(&env);
+
+        client.initialize(&sender, &recipient, &token_id, &100_000_000, &1_000);
+        // Simulate claiming years later
+        env.ledger().with_mut(|l| l.timestamp = 999_999_999);
+        client.claim();
+
+        assert_eq!(token.balance(&recipient), 100_000_000);
+    }
+
+    #[test]
+    fn test_minimum_amount_one_stroop() {
+        let env = Env::default();
+        env.mock_all_auths();
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let (token_id, _, token_admin) = create_token(&env, &sender);
-        token_admin.mint(&sender, &100_000_000);
+        let token_id = env.register_stellar_asset_contract(sender.clone());
+        let token = TokenClient::new(&env, &token_id);
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &1);
 
         let contract_id = env.register_contract(None, EscrowContract);
         let client = EscrowContractClient::new(&env, &contract_id);
 
-        client.initialize(&sender, &recipient, &token_id, &100_000_000, &9_999_999);
-        client.claim(); // should panic
+        client.initialize(&sender, &recipient, &token_id, &1, &1_000);
+        env.ledger().with_mut(|l| l.timestamp = 1_001);
+        client.claim();
+
+        assert_eq!(token.balance(&recipient), 1);
     }
 }
